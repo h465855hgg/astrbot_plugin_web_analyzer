@@ -13,7 +13,7 @@
 
 1. 将插件目录复制到AstrBot的插件目录：
    ```bash
-   cp -r astrbot_plugin_web_analyzer /AstrBot/data/plugins/
+   cp -r astrbot_plugin_web_analyzer /path/to/AstrBot/data/plugins/
    ```
 
 2. 安装依赖：

@@ -122,7 +122,7 @@ class WebAnalyzer:
 
 from astrbot.api import AstrBotConfig
 
-@register("web_analyzer", "开发者", "网页链接分析和总结插件", "1.0.0", "https://github.com/your-repo/astrbot_plugin_web_analyzer")
+@register("astrbot_plugin_web_analyzer", "Sakura520222", "自动识别网页链接并进行内容分析和总结", "1.0.0", "https://github.com/Sakura520222/astrbot_plugin_web_analyzer")
 class WebAnalyzerPlugin(Star):
     """网页分析插件主类"""
     

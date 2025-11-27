@@ -119,5 +119,80 @@
     "type": "text",
     "hint": "自定义LLM分析提示词模板，可使用变量：{title}、{url}、{content}、{max_length}",
     "default": ""
+  },
+  "translation_settings": {
+    "description": "翻译设置",
+    "type": "object",
+    "hint": "网页内容翻译配置选项",
+    "items": {
+      "enable_translation": {
+        "description": "启用网页翻译",
+        "type": "bool",
+        "hint": "是否启用网页内容翻译功能",
+        "default": false
+      },
+      "target_language": {
+        "description": "目标语言",
+        "type": "string",
+        "hint": "翻译的目标语言，如zh、en、ja等",
+        "default": "zh"
+      },
+      "translation_provider": {
+        "description": "翻译提供商",
+        "type": "string",
+        "hint": "选择用于翻译的提供商，支持LLM内置翻译或外部API",
+        "default": "llm"
+      },
+      "custom_translation_prompt": {
+        "description": "自定义翻译提示词",
+        "type": "text",
+        "hint": "自定义LLM翻译提示词模板，可使用变量：{content}、{target_language}",
+        "default": ""
+      }
+    }
+  },
+  "cache_settings": {
+    "description": "缓存设置",
+    "type": "object",
+    "hint": "分析结果缓存配置选项",
+    "items": {
+      "enable_cache": {
+        "description": "启用结果缓存",
+        "type": "bool",
+        "hint": "是否启用分析结果缓存，避免重复分析同一网页",
+        "default": true
+      },
+      "cache_expire_time": {
+        "description": "缓存过期时间",
+        "type": "int",
+        "hint": "缓存结果的过期时间（分钟）",
+        "default": 1440
+      },
+      "max_cache_size": {
+        "description": "最大缓存数量",
+        "type": "int",
+        "hint": "最大缓存的分析结果数量",
+        "default": 100
+      }
+    }
+  },
+  "content_extraction_settings": {
+    "description": "内容提取设置",
+    "type": "object",
+    "hint": "特定类型内容提取配置选项",
+    "items": {
+      "enable_specific_extraction": {
+        "description": "启用特定内容提取",
+        "type": "bool",
+        "hint": "是否启用特定类型内容提取功能",
+        "default": false
+      },
+      "extract_types": {
+        "description": "提取内容类型",
+        "type": "text",
+        "hint": "要提取的特定内容类型，每行一个，支持：title, content, images, links, tables, lists, code",
+        "default": "title\ncontent"
+      }
+    }
   }
 }

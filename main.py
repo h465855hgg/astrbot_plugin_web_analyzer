@@ -225,7 +225,29 @@ class WebAnalyzerPlugin(Star):
         # 自定义提示词配置
         self.custom_prompt = config.get('custom_prompt', '')  # 自定义分析提示词
         
-        self.analyzer = WebAnalyzer(self.max_content_length, self.timeout)
+        # 翻译设置
+        translation_settings = config.get('translation_settings', {})
+        self.enable_translation = translation_settings.get('enable_translation', False)
+        self.target_language = translation_settings.get('target_language', 'zh')
+        self.translation_provider = translation_settings.get('translation_provider', 'llm')
+        self.custom_translation_prompt = translation_settings.get('custom_translation_prompt', '')
+        
+        # 缓存设置
+        cache_settings = config.get('cache_settings', {})
+        self.enable_cache = cache_settings.get('enable_cache', True)
+        self.cache_expire_time = cache_settings.get('cache_expire_time', 1440)  # 分钟
+        self.max_cache_size = cache_settings.get('max_cache_size', 100)
+        
+        # 初始化缓存
+        self.cache = {}
+        
+        # 内容提取设置
+        content_extraction_settings = config.get('content_extraction_settings', {})
+        self.enable_specific_extraction = content_extraction_settings.get('enable_specific_extraction', False)
+        extract_types_text = content_extraction_settings.get('extract_types', 'title\ncontent')
+        self.extract_types = [t.strip() for t in extract_types_text.split('\n') if t.strip()]
+        
+        self.analyzer = WebAnalyzer(self.max_content_length, self.timeout, self.user_agent)
     
     def _parse_domain_list(self, domain_text: str) -> List[str]:
         """解析域名列表文本为列表"""
@@ -363,6 +385,13 @@ class WebAnalyzerPlugin(Star):
         async with WebAnalyzer(self.max_content_length, self.timeout, self.user_agent) as analyzer:
             for url in urls:
                 try:
+                    # 检查缓存
+                    cached_result = self._check_cache(url)
+                    if cached_result:
+                        logger.info(f"使用缓存结果: {url}")
+                        analysis_results.append(cached_result)
+                        continue
+                    
                     # 抓取网页内容
                     html = await analyzer.fetch_webpage(url)
                     if not html:
@@ -383,8 +412,41 @@ class WebAnalyzerPlugin(Star):
                         })
                         continue
                     
-                    # 调用LLM进行分析
-                    analysis_result = await self.analyze_with_llm(event, content_data)
+                    # 翻译内容（如果启用）
+                    if self.enable_translation:
+                        translated_content = await self._translate_content(event, content_data['content'])
+                        # 创建翻译后的内容数据副本
+                        translated_content_data = content_data.copy()
+                        translated_content_data['content'] = translated_content
+                        # 调用LLM进行分析（使用翻译后的内容）
+                        analysis_result = await self.analyze_with_llm(event, translated_content_data)
+                    else:
+                        # 直接调用LLM进行分析
+                        analysis_result = await self.analyze_with_llm(event, content_data)
+                    
+                    # 提取特定类型内容（如果启用）
+                    specific_content = self._extract_specific_content(html, url)
+                    if specific_content:
+                        # 在分析结果中添加特定内容
+                        specific_content_str = "\n\n**特定内容提取**\n"
+                        
+                        if 'images' in specific_content and specific_content['images']:
+                            specific_content_str += f"\n📷 图片链接 ({len(specific_content['images'])}):\n"
+                            for img_url in specific_content['images']:
+                                specific_content_str += f"- {img_url}\n"
+                        
+                        if 'links' in specific_content and specific_content['links']:
+                            specific_content_str += f"\n🔗 相关链接 ({len(specific_content['links'])}):\n"
+                            for link in specific_content['links'][:5]:  # 只显示前5个链接
+                                specific_content_str += f"- [{link['text']}]({link['url']})\n"
+                        
+                        if 'code_blocks' in specific_content and specific_content['code_blocks']:
+                            specific_content_str += f"\n💻 代码块 ({len(specific_content['code_blocks'])}):\n"
+                            for i, code in enumerate(specific_content['code_blocks'][:2]):  # 只显示前2个代码块
+                                specific_content_str += f"```\n{code}\n```\n"
+                        
+                        # 添加到分析结果中
+                        analysis_result += specific_content_str
                     
                     # 捕获截图
                     screenshot = None
@@ -397,11 +459,17 @@ class WebAnalyzerPlugin(Star):
                             wait_time=self.screenshot_wait_time
                         )
                     
-                    analysis_results.append({
+                    # 准备结果数据
+                    result_data = {
                         'url': url,
                         'result': analysis_result,
                         'screenshot': screenshot
-                    })
+                    }
+                    
+                    # 更新缓存
+                    self._update_cache(url, result_data)
+                    
+                    analysis_results.append(result_data)
                 except Exception as e:
                     logger.error(f"处理URL {url} 时出错: {e}")
                     analysis_results.append({
@@ -618,6 +686,21 @@ class WebAnalyzerPlugin(Star):
 - 指定提供商: {self.llm_provider if self.llm_provider else '使用会话默认'}
 - 自定义提示词: {'✅ 已启用' if self.custom_prompt else '❌ 未设置'}
 
+**翻译设置**
+- 启用网页翻译: {'✅ 已启用' if self.enable_translation else '❌ 已禁用'}
+- 目标语言: {self.target_language}
+- 翻译提供商: {self.translation_provider}
+- 自定义翻译提示词: {'✅ 已启用' if self.custom_translation_prompt else '❌ 未设置'}
+
+**缓存设置**
+- 启用结果缓存: {'✅ 已启用' if self.enable_cache else '❌ 已禁用'}
+- 缓存过期时间: {self.cache_expire_time} 分钟
+- 最大缓存数量: {self.max_cache_size} 个
+
+**内容提取设置**
+- 启用特定内容提取: {'✅ 已启用' if self.enable_specific_extraction else '❌ 已禁用'}
+- 提取内容类型: {', '.join(self.extract_types)}
+
 *提示: 如需修改配置，请在AstrBot管理面板中编辑插件配置*"""
         
         yield event.plain_result(config_info)
@@ -735,6 +818,40 @@ class WebAnalyzerPlugin(Star):
         else:
             yield event.plain_result("无效的操作，请使用: add <群号>, remove <群号>, clear")
     
+    @filter.command("web_cache", alias={'网页缓存', '清理缓存'})
+    async def manage_cache(self, event: AstrMessageEvent):
+        """管理缓存"""
+        # 解析命令参数
+        message_parts = event.message_str.strip().split()
+        
+        # 如果没有参数，显示当前缓存状态
+        if len(message_parts) <= 1:
+            cache_count = len(self.cache)
+            cache_info = f"**当前缓存状态**\n\n"
+            cache_info += f"- 缓存数量: {cache_count} 个\n"
+            cache_info += f"- 缓存过期时间: {self.cache_expire_time} 分钟\n"
+            cache_info += f"- 最大缓存数量: {self.max_cache_size} 个\n"
+            cache_info += f"- 缓存功能: {'✅ 已启用' if self.enable_cache else '❌ 已禁用'}\n"
+            
+            cache_info += "\n使用 `/web_cache clear` 清空所有缓存"
+            
+            yield event.plain_result(cache_info)
+            return
+        
+        action = message_parts[1].lower() if len(message_parts) > 1 else ""
+        
+        if action == "clear":
+            # 清空缓存
+            if not self.cache:
+                yield event.plain_result("缓存已为空")
+                return
+            
+            self.cache.clear()
+            yield event.plain_result(f"✅ 已清空所有缓存，共清理了 {len(self.cache)} 个缓存项")
+            
+        else:
+            yield event.plain_result("无效的操作，请使用: clear")
+    
     def _save_group_blacklist(self):
         """保存群聊黑名单到配置"""
         try:
@@ -745,6 +862,243 @@ class WebAnalyzerPlugin(Star):
             self.config.save_config()
         except Exception as e:
             logger.error(f"保存群聊黑名单失败: {e}")
+    
+    def _check_cache(self, url: str) -> dict:
+        """检查缓存是否存在且有效"""
+        if not self.enable_cache:
+            return None
+        
+        import time
+        current_time = time.time()
+        
+        if url in self.cache:
+            cache_data = self.cache[url]
+            if current_time - cache_data['timestamp'] < self.cache_expire_time * 60:
+                return cache_data['result']
+            else:
+                # 缓存过期，删除
+                del self.cache[url]
+        
+        return None
+    
+    def _update_cache(self, url: str, result: dict):
+        """更新缓存"""
+        if not self.enable_cache:
+            return
+        
+        import time
+        current_time = time.time()
+        
+        # 清理过期缓存
+        self._clean_cache()
+        
+        # 检查缓存大小
+        if len(self.cache) >= self.max_cache_size:
+            # 删除最旧的缓存
+            oldest_url = min(self.cache, key=lambda k: self.cache[k]['timestamp'])
+            del self.cache[oldest_url]
+        
+        # 添加新缓存
+        self.cache[url] = {
+            'timestamp': current_time,
+            'result': result
+        }
+    
+    def _clean_cache(self):
+        """清理过期缓存"""
+        import time
+        current_time = time.time()
+        
+        expired_urls = []
+        for url, cache_data in self.cache.items():
+            if current_time - cache_data['timestamp'] >= self.cache_expire_time * 60:
+                expired_urls.append(url)
+        
+        for url in expired_urls:
+            del self.cache[url]
+    
+    async def _translate_content(self, event: AstrMessageEvent, content: str) -> str:
+        """翻译网页内容"""
+        if not self.enable_translation:
+            return content
+        
+        try:
+            # 检查LLM是否可用
+            if not hasattr(self.context, 'llm_generate'):
+                logger.error("LLM不可用，无法进行翻译")
+                return content
+            
+            # 优先使用配置的LLM提供商，如果没有配置则使用当前会话的模型
+            provider_id = self.llm_provider
+            if not provider_id:
+                umo = event.unified_msg_origin
+                provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            
+            if not provider_id:
+                logger.error("无法获取LLM提供商ID，无法进行翻译")
+                return content
+            
+            # 使用自定义翻译提示词或默认提示词
+            if self.custom_translation_prompt:
+                # 替换自定义提示词中的变量
+                prompt = self.custom_translation_prompt.format(
+                    content=content,
+                    target_language=self.target_language
+                )
+            else:
+                # 默认翻译提示词
+                prompt = f"请将以下内容翻译成{self.target_language}语言，保持原文意思不变，语言流畅自然：\n\n{content}"
+            
+            # 调用LLM进行翻译
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt
+            )
+            
+            if llm_resp and llm_resp.completion_text:
+                return llm_resp.completion_text.strip()
+            else:
+                logger.error("LLM翻译返回为空")
+                return content
+        except Exception as e:
+            logger.error(f"翻译内容失败: {e}")
+            return content
+    
+    def _extract_specific_content(self, html: str, url: str) -> dict:
+        """提取特定类型的内容"""
+        if not self.enable_specific_extraction:
+            return {}
+        
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, 'lxml')
+            
+            extracted_content = {}
+            
+            # 提取标题
+            if 'title' in self.extract_types:
+                title = soup.find('title')
+                extracted_content['title'] = title.get_text().strip() if title else "无标题"
+            
+            # 提取正文内容
+            if 'content' in self.extract_types:
+                content_selectors = [
+                    'article',
+                    'main',
+                    '.article-content',
+                    '.post-content',
+                    '.content',
+                    'body'
+                ]
+                
+                content_text = ""
+                for selector in content_selectors:
+                    element = soup.select_one(selector)
+                    if element:
+                        for script in element(['script', 'style']):
+                            script.decompose()
+                        text = element.get_text(separator='\n', strip=True)
+                        if len(text) > len(content_text):
+                            content_text = text
+                
+                if len(content_text) > self.max_content_length:
+                    content_text = content_text[:self.max_content_length] + "..."
+                
+                extracted_content['content'] = content_text
+            
+            # 提取图片链接
+            if 'images' in self.extract_types:
+                images = []
+                for img in soup.find_all('img'):
+                    src = img.get('src')
+                    if src:
+                        # 处理相对路径
+                        from urllib.parse import urljoin
+                        full_url = urljoin(url, src)
+                        images.append(full_url)
+                extracted_content['images'] = images[:10]  # 最多提取10张图片
+            
+            # 提取链接
+            if 'links' in self.extract_types:
+                links = []
+                for a in soup.find_all('a', href=True):
+                    href = a.get('href')
+                    if href and not href.startswith('#'):
+                        from urllib.parse import urljoin
+                        full_url = urljoin(url, href)
+                        links.append({
+                            'text': a.get_text().strip() or full_url,
+                            'url': full_url
+                        })
+                extracted_content['links'] = links[:20]  # 最多提取20个链接
+            
+            # 提取表格
+            if 'tables' in self.extract_types:
+                tables = []
+                for table in soup.find_all('table'):
+                    table_data = []
+                    # 提取表头
+                    headers = []
+                    thead = table.find('thead')
+                    if thead:
+                        for th in thead.find_all('th'):
+                            headers.append(th.get_text().strip())
+                    
+                    # 提取表体
+                    tbody = table.find('tbody') or table
+                    for row in tbody.find_all('tr'):
+                        row_data = []
+                        for cell in row.find_all(['td', 'th']):
+                            row_data.append(cell.get_text().strip())
+                        if row_data:
+                            table_data.append(row_data)
+                    
+                    if table_data:
+                        tables.append({
+                            'headers': headers,
+                            'rows': table_data
+                        })
+                extracted_content['tables'] = tables[:5]  # 最多提取5个表格
+            
+            # 提取列表
+            if 'lists' in self.extract_types:
+                lists = []
+                # 提取无序列表
+                for ul in soup.find_all('ul'):
+                    list_items = []
+                    for li in ul.find_all('li'):
+                        list_items.append(li.get_text().strip())
+                    if list_items:
+                        lists.append({
+                            'type': 'ul',
+                            'items': list_items[:20]  # 每个列表最多提取20项
+                        })
+                
+                # 提取有序列表
+                for ol in soup.find_all('ol'):
+                    list_items = []
+                    for li in ol.find_all('li'):
+                        list_items.append(li.get_text().strip())
+                    if list_items:
+                        lists.append({
+                            'type': 'ol',
+                            'items': list_items[:20]  # 每个列表最多提取20项
+                        })
+                extracted_content['lists'] = lists[:10]  # 最多提取10个列表
+            
+            # 提取代码块
+            if 'code' in self.extract_types:
+                code_blocks = []
+                for code in soup.find_all(['pre', 'code']):
+                    code_text = code.get_text().strip()
+                    if code_text and len(code_text) > 10:
+                        code_blocks.append(code_text[:1000] + "..." if len(code_text) > 1000 else code_text)
+                extracted_content['code_blocks'] = code_blocks[:5]  # 最多提取5个代码块
+            
+            return extracted_content
+        except Exception as e:
+            logger.error(f"提取特定内容失败: {e}")
+            return {}
     
     async def _send_analysis_result(self, event, analysis_results):
         '''发送分析结果，根据开关决定是否使用合并转发'''

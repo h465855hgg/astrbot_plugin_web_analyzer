@@ -3,187 +3,18 @@ AstrBot 网页分析插件
 自动识别用户发送的网页链接，抓取内容并调用LLM进行分析和总结
 """
 
-import re
-from typing import List, Optional
-from urllib.parse import urlparse
-
-import httpx
-from bs4 import BeautifulSoup
+from typing import List
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-
-class WebAnalyzer:
-    """网页分析器类"""
-    
-    def __init__(self, max_content_length: int = 10000, timeout: int = 30, user_agent: str = None):
-        self.max_content_length = max_content_length
-        self.timeout = timeout
-        self.user_agent = user_agent or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        self.client = None
-        self.browser = None
-    
-    async def __aenter__(self):
-        """异步上下文管理器入口"""
-        self.client = httpx.AsyncClient(timeout=self.timeout)
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """异步上下文管理器出口"""
-        if self.client:
-            await self.client.aclose()
-        if self.browser:
-            await self.browser.close()
-    
-    def extract_urls(self, text: str) -> List[str]:
-        """从文本中提取URL链接"""
-        # 匹配常见的URL格式
-        url_pattern = r'https?://[^\s\u4e00-\u9fff]+'
-        urls = re.findall(url_pattern, text)
-        return urls
-    
-    def is_valid_url(self, url: str) -> bool:
-        """验证URL是否有效"""
-        try:
-            result = urlparse(url)
-            return all([result.scheme, result.netloc])
-        except Exception:
-            return False
-    
-    async def fetch_webpage(self, url: str) -> Optional[str]:
-        """抓取网页内容"""
-        try:
-            headers = {
-                'User-Agent': self.user_agent
-            }
-            
-            response = await self.client.get(url, headers=headers, follow_redirects=True)
-            response.raise_for_status()
-            
-            return response.text
-        except Exception as e:
-            logger.error(f"抓取网页失败: {url}, 错误: {e}")
-            return None
-    
-    def extract_content(self, html: str, url: str) -> dict:
-        """从HTML中提取主要内容"""
-        try:
-            soup = BeautifulSoup(html, 'lxml')
-            
-            # 提取标题
-            title = soup.find('title')
-            title_text = title.get_text().strip() if title else "无标题"
-            
-            # 尝试提取文章内容（优先选择article、main等语义化标签）
-            content_selectors = [
-                'article',
-                'main',
-                '.article-content',
-                '.post-content',
-                '.content',
-                'body'
-            ]
-            
-            content_text = ""
-            for selector in content_selectors:
-                element = soup.select_one(selector)
-                if element:
-                    # 移除脚本和样式标签
-                    for script in element(['script', 'style']):
-                        script.decompose()
-                    
-                    text = element.get_text(separator='\n', strip=True)
-                    if len(text) > len(content_text):
-                        content_text = text
-            
-            # 如果没找到合适的内容，使用body
-            if not content_text:
-                body = soup.find('body')
-                if body:
-                    for script in body(['script', 'style']):
-                        script.decompose()
-                    content_text = body.get_text(separator='\n', strip=True)
-            
-            # 限制内容长度
-            if len(content_text) > self.max_content_length:
-                content_text = content_text[:self.max_content_length] + "..."
-            
-            return {
-                'title': title_text,
-                'content': content_text,
-                'url': url
-            }
-        except Exception as e:
-            logger.error(f"解析网页内容失败: {e}")
-            return None
-    
-    async def capture_screenshot(self, url: str, quality: int = 80, width: int = 1280, full_page: bool = False, wait_time: int = 2000) -> Optional[bytes]:
-        """捕获网页截图"""
-        try:
-            from playwright.async_api import async_playwright
-            import sys
-            import subprocess
-            
-            # 首先尝试安装浏览器（无论是否已安装，playwright install都会检查并更新）
-            logger.info("正在检查并安装浏览器...")
-            result = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], 
-                                  capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                logger.error(f"浏览器安装失败: {result.stderr}")
-                return None
-            
-            logger.info("浏览器安装成功，正在尝试截图...")
-            
-            # 尝试启动playwright并截图
-            async with async_playwright() as p:
-                # 启动浏览器（无头模式）
-                self.browser = await p.chromium.launch(
-                    headless=True,
-                    # 添加额外的启动参数，提高兼容性
-                    args=[
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-gpu',
-                        '--remote-debugging-port=9222'
-                    ]
-                )
-                page = await self.browser.new_page(
-                    viewport={'width': width, 'height': 720},
-                    user_agent=self.user_agent
-                )
-                
-                # 导航到目标URL，使用更宽松的等待条件
-                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-                
-                # 等待指定时间，确保页面完全加载
-                await page.wait_for_timeout(wait_time)
-                
-                # 捕获截图
-                screenshot_bytes = await page.screenshot(
-                    full_page=full_page,
-                    quality=quality,
-                    type='jpeg'
-                )
-                
-                await self.browser.close()
-                self.browser = None
-                
-                logger.info("截图成功")
-                return screenshot_bytes
-        except Exception as e:
-            logger.error(f"捕获网页截图失败: {url}, 错误: {e}")
-            if self.browser:
-                await self.browser.close()
-                self.browser = None
-            return None
+from .analyzer import WebAnalyzer
+from .cache import CacheManager
 
 
-@register("astrbot_plugin_web_analyzer", "Sakura520222", "自动识别网页链接并进行内容分析和总结", "1.0.0", "https://github.com/Sakura520222/astrbot_plugin_web_analyzer")
+@register("astrbot_plugin_web_analyzer", "Sakura520222", "自动识别网页链接并进行内容分析和总结", "1.2.2", "https://github.com/Sakura520222/astrbot_plugin_web_analyzer")
 class WebAnalyzerPlugin(Star):
     """网页分析插件主类"""
     
@@ -191,26 +22,53 @@ class WebAnalyzerPlugin(Star):
         super().__init__(context)
         self.config = config
         
-        # 从配置获取参数
-        self.max_content_length = config.get('max_content_length', 10000)
-        self.timeout = config.get('request_timeout', 30)
-        self.llm_enabled = config.get('llm_enabled', True)
-        self.auto_analyze = config.get('auto_analyze', True)
+        # 从配置获取参数并进行验证
+        # 基本配置验证
+        self.max_content_length = max(1000, config.get('max_content_length', 10000))  # 至少1000字符
+        self.timeout = max(5, min(300, config.get('request_timeout', 30)))  # 5-300秒
+        self.retry_count = max(0, min(10, config.get('retry_count', 3)))  # 0-10次
+        self.retry_delay = max(0, min(10, config.get('retry_delay', 2)))  # 0-10秒
+        self.llm_enabled = bool(config.get('llm_enabled', True))
+        self.auto_analyze = bool(config.get('auto_analyze', True))
         self.user_agent = config.get('user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+        self.proxy = config.get('proxy', '')
+        
+        # 验证代理格式（如果提供了代理）
+        if self.proxy:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(self.proxy)
+                if not all([parsed.scheme, parsed.netloc]):
+                    logger.warning(f"无效的代理格式: {self.proxy}，将忽略代理设置")
+                    self.proxy = ''
+            except Exception as e:
+                logger.warning(f"解析代理失败: {self.proxy}，将忽略代理设置，错误: {e}")
+                self.proxy = ''
+        
         self.allowed_domains = self._parse_domain_list(config.get('allowed_domains', ''))
         self.blocked_domains = self._parse_domain_list(config.get('blocked_domains', ''))
         
-        # 分析设置
+        # 分析设置验证
         analysis_settings = config.get('analysis_settings', {})
-        self.enable_emoji = analysis_settings.get('enable_emoji', True)
-        self.enable_statistics = analysis_settings.get('enable_statistics', True)
-        self.max_summary_length = analysis_settings.get('max_summary_length', 2000)
-        # 截图设置
-        self.enable_screenshot = analysis_settings.get('enable_screenshot', True)
-        self.screenshot_quality = analysis_settings.get('screenshot_quality', 80)
-        self.screenshot_width = analysis_settings.get('screenshot_width', 1280)
-        self.screenshot_full_page = analysis_settings.get('screenshot_full_page', False)
-        self.screenshot_wait_time = analysis_settings.get('screenshot_wait_time', 2000)
+        self.enable_emoji = bool(analysis_settings.get('enable_emoji', True))
+        self.enable_statistics = bool(analysis_settings.get('enable_statistics', True))
+        self.max_summary_length = max(500, min(10000, analysis_settings.get('max_summary_length', 2000)))  # 500-10000字符
+        
+        # 截图设置验证
+        self.enable_screenshot = bool(analysis_settings.get('enable_screenshot', True))
+        self.screenshot_quality = max(10, min(100, analysis_settings.get('screenshot_quality', 80)))  # 10-100
+        self.screenshot_width = max(320, min(4096, analysis_settings.get('screenshot_width', 1280)))  # 320-4096px
+        self.screenshot_height = max(240, min(4096, analysis_settings.get('screenshot_height', 720)))  # 240-4096px
+        self.screenshot_full_page = bool(analysis_settings.get('screenshot_full_page', False))
+        self.screenshot_wait_time = max(0, min(10000, analysis_settings.get('screenshot_wait_time', 2000)))  # 0-10000ms
+        
+        # 验证截图格式
+        screenshot_format = analysis_settings.get('screenshot_format', 'jpeg').lower()
+        if screenshot_format not in ['jpeg', 'png']:
+            logger.warning(f"无效的截图格式: {screenshot_format}，将使用默认格式 jpeg")
+            self.screenshot_format = 'jpeg'
+        else:
+            self.screenshot_format = screenshot_format
         
         # LLM提供商配置
         self.llm_provider = config.get('llm_provider', '')
@@ -220,34 +78,70 @@ class WebAnalyzerPlugin(Star):
         self.group_blacklist = self._parse_group_list(group_blacklist_text)
         
         # 合并转发配置
-        self.merge_forward_enabled = config.get('merge_forward_enabled', False)  # 是否启用合并转发
+        self.merge_forward_enabled = bool(config.get('merge_forward_enabled', False))  # 是否启用合并转发
         
         # 自定义提示词配置
         self.custom_prompt = config.get('custom_prompt', '')  # 自定义分析提示词
         
-        # 翻译设置
+        # 翻译设置验证
         translation_settings = config.get('translation_settings', {})
-        self.enable_translation = translation_settings.get('enable_translation', False)
-        self.target_language = translation_settings.get('target_language', 'zh')
+        self.enable_translation = bool(translation_settings.get('enable_translation', False))
+        
+        # 验证目标语言
+        self.target_language = translation_settings.get('target_language', 'zh').lower()
+        valid_languages = ['zh', 'en', 'ja', 'ko', 'fr', 'de', 'es', 'ru', 'ar', 'pt']
+        if self.target_language not in valid_languages:
+            logger.warning(f"无效的目标语言: {self.target_language}，将使用默认语言 zh")
+            self.target_language = 'zh'
+        
         self.translation_provider = translation_settings.get('translation_provider', 'llm')
         self.custom_translation_prompt = translation_settings.get('custom_translation_prompt', '')
         
-        # 缓存设置
+        # 缓存设置验证
         cache_settings = config.get('cache_settings', {})
-        self.enable_cache = cache_settings.get('enable_cache', True)
-        self.cache_expire_time = cache_settings.get('cache_expire_time', 1440)  # 分钟
-        self.max_cache_size = cache_settings.get('max_cache_size', 100)
+        self.enable_cache = bool(cache_settings.get('enable_cache', True))
+        self.cache_expire_time = max(5, min(10080, cache_settings.get('cache_expire_time', 1440)))  # 5-10080分钟（7天）
+        self.max_cache_size = max(10, min(1000, cache_settings.get('max_cache_size', 100)))  # 10-1000个
         
-        # 初始化缓存
-        self.cache = {}
+        # 初始化缓存管理器
+        self.cache_manager = CacheManager(
+            max_size=self.max_cache_size,
+            expire_time=self.cache_expire_time
+        )
         
-        # 内容提取设置
+        # 内容提取设置验证
         content_extraction_settings = config.get('content_extraction_settings', {})
-        self.enable_specific_extraction = content_extraction_settings.get('enable_specific_extraction', False)
+        self.enable_specific_extraction = bool(content_extraction_settings.get('enable_specific_extraction', False))
         extract_types_text = content_extraction_settings.get('extract_types', 'title\ncontent')
         self.extract_types = [t.strip() for t in extract_types_text.split('\n') if t.strip()]
         
-        self.analyzer = WebAnalyzer(self.max_content_length, self.timeout, self.user_agent)
+        # 验证提取类型
+        valid_extract_types = ['title', 'content', 'images', 'links', 'tables', 'lists', 'code', 'meta']
+        invalid_types = [t for t in self.extract_types if t not in valid_extract_types]
+        if invalid_types:
+            logger.warning(f"无效的提取类型: {', '.join(invalid_types)}，将忽略这些类型")
+            self.extract_types = [t for t in self.extract_types if t in valid_extract_types]
+        
+        # 确保至少有一个提取类型
+        if not self.extract_types:
+            self.extract_types = ['title', 'content']
+        
+        # 添加meta类型到提取类型中（如果没有）
+        if 'meta' not in self.extract_types:
+            self.extract_types.append('meta')
+        
+        # 初始化分析器
+        self.analyzer = WebAnalyzer(
+            max_content_length=self.max_content_length, 
+            timeout=self.timeout, 
+            user_agent=self.user_agent, 
+            proxy=self.proxy, 
+            retry_count=self.retry_count, 
+            retry_delay=self.retry_delay
+        )
+        
+        # 记录配置验证完成
+        logger.info("插件配置验证完成")
     
     def _parse_domain_list(self, domain_text: str) -> List[str]:
         """解析域名列表文本为列表"""
@@ -293,7 +187,7 @@ class WebAnalyzerPlugin(Star):
         except Exception:
             return False
     
-    @filter.command("网页分析", alias={'分析', '总结'})
+    @filter.command("网页分析", alias={'分析', '总结', 'web', 'analyze'})
     async def analyze_webpage(self, event: AstrMessageEvent):
         """手动分析指定网页链接"""
         message_text = event.message_str
@@ -377,106 +271,121 @@ class WebAnalyzerPlugin(Star):
         async for result in self._batch_process_urls(event, allowed_urls):
             yield result
     
+    async def _process_single_url(self, event: AstrMessageEvent, url: str, analyzer: WebAnalyzer) -> dict:
+        """处理单个URL，返回分析结果"""
+        try:
+            # 检查缓存
+            cached_result = self._check_cache(url)
+            if cached_result:
+                logger.info(f"使用缓存结果: {url}")
+                return cached_result
+            
+            # 抓取网页内容
+            html = await analyzer.fetch_webpage(url)
+            if not html:
+                return {
+                    'url': url,
+                    'result': f"❌ 无法抓取网页内容: {url}",
+                    'screenshot': None
+                }
+            
+            # 提取内容
+            content_data = analyzer.extract_content(html, url)
+            if not content_data:
+                return {
+                    'url': url,
+                    'result': f"❌ 无法解析网页内容: {url}",
+                    'screenshot': None
+                }
+            
+            # 翻译内容（如果启用）
+            if self.enable_translation:
+                translated_content = await self._translate_content(event, content_data['content'])
+                # 创建翻译后的内容数据副本
+                translated_content_data = content_data.copy()
+                translated_content_data['content'] = translated_content
+                # 调用LLM进行分析（使用翻译后的内容）
+                analysis_result = await self.analyze_with_llm(event, translated_content_data)
+            else:
+                # 直接调用LLM进行分析
+                analysis_result = await self.analyze_with_llm(event, content_data)
+            
+            # 提取特定类型内容（如果启用）
+            specific_content = self._extract_specific_content(html, url)
+            if specific_content:
+                # 在分析结果中添加特定内容
+                specific_content_str = "\n\n**特定内容提取**\n"
+                
+                if 'images' in specific_content and specific_content['images']:
+                    specific_content_str += f"\n📷 图片链接 ({len(specific_content['images'])}):\n"
+                    for img_url in specific_content['images']:
+                        specific_content_str += f"- {img_url}\n"
+                
+                if 'links' in specific_content and specific_content['links']:
+                    specific_content_str += f"\n🔗 相关链接 ({len(specific_content['links'])}):\n"
+                    for link in specific_content['links'][:5]:  # 只显示前5个链接
+                        specific_content_str += f"- [{link['text']}]({link['url']})\n"
+                
+                if 'code_blocks' in specific_content and specific_content['code_blocks']:
+                    specific_content_str += f"\n💻 代码块 ({len(specific_content['code_blocks'])}):\n"
+                    for i, code in enumerate(specific_content['code_blocks'][:2]):  # 只显示前2个代码块
+                        specific_content_str += f"```\n{code}\n```\n"
+                
+                # 添加元信息
+                if 'meta' in specific_content and specific_content['meta']:
+                    meta_info = specific_content['meta']
+                    specific_content_str += "\n📋 元信息:\n"
+                    for key, value in meta_info.items():
+                        if value:
+                            specific_content_str += f"- {key}: {value}\n"
+                
+                # 添加到分析结果中
+                analysis_result += specific_content_str
+            
+            # 捕获截图
+            screenshot = None
+            if self.enable_screenshot:
+                screenshot = await analyzer.capture_screenshot(
+                    url,
+                    quality=self.screenshot_quality,
+                    width=self.screenshot_width,
+                    height=self.screenshot_height,
+                    full_page=self.screenshot_full_page,
+                    wait_time=self.screenshot_wait_time,
+                    format=self.screenshot_format
+                )
+            
+            # 准备结果数据
+            result_data = {
+                'url': url,
+                'result': analysis_result,
+                'screenshot': screenshot
+            }
+            
+            # 更新缓存
+            self._update_cache(url, result_data)
+            
+            return result_data
+        except Exception as e:
+            logger.error(f"处理URL {url} 时出错: {e}")
+            return {
+                'url': url,
+                'result': f"❌ 处理URL时出错: {url}\n错误信息: {str(e)}",
+                'screenshot': None
+            }
+    
     async def _batch_process_urls(self, event: AstrMessageEvent, urls: List[str]):
         """批量处理多个URL，收集分析结果并发送"""
         # 收集所有分析结果
         analysis_results = []
         
-        async with WebAnalyzer(self.max_content_length, self.timeout, self.user_agent) as analyzer:
-            for url in urls:
-                try:
-                    # 检查缓存
-                    cached_result = self._check_cache(url)
-                    if cached_result:
-                        logger.info(f"使用缓存结果: {url}")
-                        analysis_results.append(cached_result)
-                        continue
-                    
-                    # 抓取网页内容
-                    html = await analyzer.fetch_webpage(url)
-                    if not html:
-                        analysis_results.append({
-                            'url': url,
-                            'result': f"❌ 无法抓取网页内容: {url}",
-                            'screenshot': None
-                        })
-                        continue
-                    
-                    # 提取内容
-                    content_data = analyzer.extract_content(html, url)
-                    if not content_data:
-                        analysis_results.append({
-                            'url': url,
-                            'result': f"❌ 无法解析网页内容: {url}",
-                            'screenshot': None
-                        })
-                        continue
-                    
-                    # 翻译内容（如果启用）
-                    if self.enable_translation:
-                        translated_content = await self._translate_content(event, content_data['content'])
-                        # 创建翻译后的内容数据副本
-                        translated_content_data = content_data.copy()
-                        translated_content_data['content'] = translated_content
-                        # 调用LLM进行分析（使用翻译后的内容）
-                        analysis_result = await self.analyze_with_llm(event, translated_content_data)
-                    else:
-                        # 直接调用LLM进行分析
-                        analysis_result = await self.analyze_with_llm(event, content_data)
-                    
-                    # 提取特定类型内容（如果启用）
-                    specific_content = self._extract_specific_content(html, url)
-                    if specific_content:
-                        # 在分析结果中添加特定内容
-                        specific_content_str = "\n\n**特定内容提取**\n"
-                        
-                        if 'images' in specific_content and specific_content['images']:
-                            specific_content_str += f"\n📷 图片链接 ({len(specific_content['images'])}):\n"
-                            for img_url in specific_content['images']:
-                                specific_content_str += f"- {img_url}\n"
-                        
-                        if 'links' in specific_content and specific_content['links']:
-                            specific_content_str += f"\n🔗 相关链接 ({len(specific_content['links'])}):\n"
-                            for link in specific_content['links'][:5]:  # 只显示前5个链接
-                                specific_content_str += f"- [{link['text']}]({link['url']})\n"
-                        
-                        if 'code_blocks' in specific_content and specific_content['code_blocks']:
-                            specific_content_str += f"\n💻 代码块 ({len(specific_content['code_blocks'])}):\n"
-                            for i, code in enumerate(specific_content['code_blocks'][:2]):  # 只显示前2个代码块
-                                specific_content_str += f"```\n{code}\n```\n"
-                        
-                        # 添加到分析结果中
-                        analysis_result += specific_content_str
-                    
-                    # 捕获截图
-                    screenshot = None
-                    if self.enable_screenshot:
-                        screenshot = await analyzer.capture_screenshot(
-                            url,
-                            quality=self.screenshot_quality,
-                            width=self.screenshot_width,
-                            full_page=self.screenshot_full_page,
-                            wait_time=self.screenshot_wait_time
-                        )
-                    
-                    # 准备结果数据
-                    result_data = {
-                        'url': url,
-                        'result': analysis_result,
-                        'screenshot': screenshot
-                    }
-                    
-                    # 更新缓存
-                    self._update_cache(url, result_data)
-                    
-                    analysis_results.append(result_data)
-                except Exception as e:
-                    logger.error(f"处理URL {url} 时出错: {e}")
-                    analysis_results.append({
-                        'url': url,
-                        'result': f"❌ 处理URL时出错: {url}\n错误信息: {str(e)}",
-                        'screenshot': None
-                    })
+        async with WebAnalyzer(self.max_content_length, self.timeout, self.user_agent, self.proxy, self.retry_count, self.retry_delay) as analyzer:
+            # 使用asyncio.gather并发处理多个URL
+            import asyncio
+            # 创建任务列表
+            tasks = [self._process_single_url(event, url, analyzer) for url in urls]
+            # 并发执行所有任务
+            analysis_results = await asyncio.gather(*tasks)
         
         # 发送所有分析结果
         async for result in self._send_analysis_result(event, analysis_results):
@@ -679,6 +588,8 @@ class WebAnalyzerPlugin(Star):
 - 启用截图: {'✅ 已启用' if self.enable_screenshot else '❌ 已禁用'}
 - 截图质量: {self.screenshot_quality}
 - 截图宽度: {self.screenshot_width}px
+- 截图高度: {self.screenshot_height}px
+- 截图格式: {self.screenshot_format}
 - 截取整页: {'✅ 已启用' if self.screenshot_full_page else '❌ 已禁用'}
 - 截图等待时间: {self.screenshot_wait_time}ms
 
@@ -826,9 +737,11 @@ class WebAnalyzerPlugin(Star):
         
         # 如果没有参数，显示当前缓存状态
         if len(message_parts) <= 1:
-            cache_count = len(self.cache)
-            cache_info = f"**当前缓存状态**\n\n"
-            cache_info += f"- 缓存数量: {cache_count} 个\n"
+            cache_stats = self.cache_manager.get_stats()
+            cache_info = "**当前缓存状态**\n\n"
+            cache_info += f"- 缓存总数: {cache_stats['total']} 个\n"
+            cache_info += f"- 有效缓存: {cache_stats['valid']} 个\n"
+            cache_info += f"- 过期缓存: {cache_stats['expired']} 个\n"
             cache_info += f"- 缓存过期时间: {self.cache_expire_time} 分钟\n"
             cache_info += f"- 最大缓存数量: {self.max_cache_size} 个\n"
             cache_info += f"- 缓存功能: {'✅ 已启用' if self.enable_cache else '❌ 已禁用'}\n"
@@ -842,12 +755,9 @@ class WebAnalyzerPlugin(Star):
         
         if action == "clear":
             # 清空缓存
-            if not self.cache:
-                yield event.plain_result("缓存已为空")
-                return
-            
-            self.cache.clear()
-            yield event.plain_result(f"✅ 已清空所有缓存，共清理了 {len(self.cache)} 个缓存项")
+            self.cache_manager.clear()
+            cache_stats = self.cache_manager.get_stats()
+            yield event.plain_result(f"✅ 已清空所有缓存，当前缓存数量: {cache_stats['total']} 个")
             
         else:
             yield event.plain_result("无效的操作，请使用: clear")
@@ -904,10 +814,10 @@ class WebAnalyzerPlugin(Star):
                 })
             else:
                 # 如果缓存中没有，先进行分析
-                yield event.plain_result(f"缓存中没有该URL的分析结果，正在进行分析...")
+                yield event.plain_result("缓存中没有该URL的分析结果，正在进行分析...")
                 
                 # 抓取并分析网页
-                async with WebAnalyzer(self.max_content_length, self.timeout, self.user_agent) as analyzer:
+                async with WebAnalyzer(self.max_content_length, self.timeout, self.user_agent, self.proxy, self.retry_count, self.retry_delay) as analyzer:
                     html = await analyzer.fetch_webpage(url)
                     if not html:
                         yield event.plain_result(f"无法抓取网页内容: {url}")
@@ -964,7 +874,6 @@ class WebAnalyzerPlugin(Star):
         try:
             import os
             import json
-            import tempfile
             import time
             
             # 创建data目录（如果不存在）
@@ -1037,7 +946,7 @@ class WebAnalyzerPlugin(Star):
             
             elif format_type.lower() == "txt":
                 # 生成纯文本格式内容
-                txt_content = f"网页分析结果导出\n"
+                txt_content = "网页分析结果导出\n"
                 txt_content += f"导出时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}\n"
                 txt_content += f"共 {len(export_results)} 个分析结果\n"
                 txt_content += "=" * 50 + "\n\n"
@@ -1061,12 +970,12 @@ class WebAnalyzerPlugin(Star):
             
             # 构建消息链
             message_chain = [
-                Plain(f"✅ 分析结果导出成功！\n\n"),
-                Plain(f"导出格式: {format_type}\n"),
-                Plain(f"导出数量: {len(export_results)}\n\n"),
-                Plain("📁 导出文件：\n"),
-                File(file=file_path, name=os.path.basename(file_path))
-            ]
+                    Plain("✅ 分析结果导出成功！\n\n"),
+                    Plain(f"导出格式: {format_type}\n"),
+                    Plain(f"导出数量: {len(export_results)}\n\n"),
+                    Plain("📁 导出文件：\n"),
+                    File(file=file_path, name=os.path.basename(file_path))
+                ]
             
             yield event.chain_result(message_chain)
             
@@ -1092,54 +1001,19 @@ class WebAnalyzerPlugin(Star):
         if not self.enable_cache:
             return None
         
-        import time
-        current_time = time.time()
-        
-        if url in self.cache:
-            cache_data = self.cache[url]
-            if current_time - cache_data['timestamp'] < self.cache_expire_time * 60:
-                return cache_data['result']
-            else:
-                # 缓存过期，删除
-                del self.cache[url]
-        
-        return None
+        return self.cache_manager.get(url)
     
     def _update_cache(self, url: str, result: dict):
         """更新缓存"""
         if not self.enable_cache:
             return
         
-        import time
-        current_time = time.time()
-        
-        # 清理过期缓存
-        self._clean_cache()
-        
-        # 检查缓存大小
-        if len(self.cache) >= self.max_cache_size:
-            # 删除最旧的缓存
-            oldest_url = min(self.cache, key=lambda k: self.cache[k]['timestamp'])
-            del self.cache[oldest_url]
-        
-        # 添加新缓存
-        self.cache[url] = {
-            'timestamp': current_time,
-            'result': result
-        }
+        self.cache_manager.set(url, result)
     
     def _clean_cache(self):
         """清理过期缓存"""
-        import time
-        current_time = time.time()
-        
-        expired_urls = []
-        for url, cache_data in self.cache.items():
-            if current_time - cache_data['timestamp'] >= self.cache_expire_time * 60:
-                expired_urls.append(url)
-        
-        for url in expired_urls:
-            del self.cache[url]
+        # 缓存管理器会自动清理，这里留空即可
+        pass
     
     async def _translate_content(self, event: AstrMessageEvent, content: str) -> str:
         """翻译网页内容"""
@@ -1194,255 +1068,140 @@ class WebAnalyzerPlugin(Star):
             return {}
         
         try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, 'lxml')
-            
-            extracted_content = {}
-            
-            # 提取标题
-            if 'title' in self.extract_types:
-                title = soup.find('title')
-                extracted_content['title'] = title.get_text().strip() if title else "无标题"
-            
-            # 提取正文内容
-            if 'content' in self.extract_types:
-                content_selectors = [
-                    'article',
-                    'main',
-                    '.article-content',
-                    '.post-content',
-                    '.content',
-                    'body'
-                ]
-                
-                content_text = ""
-                for selector in content_selectors:
-                    element = soup.select_one(selector)
-                    if element:
-                        for script in element(['script', 'style']):
-                            script.decompose()
-                        text = element.get_text(separator='\n', strip=True)
-                        if len(text) > len(content_text):
-                            content_text = text
-                
-                if len(content_text) > self.max_content_length:
-                    content_text = content_text[:self.max_content_length] + "..."
-                
-                extracted_content['content'] = content_text
-            
-            # 提取图片链接
-            if 'images' in self.extract_types:
-                images = []
-                for img in soup.find_all('img'):
-                    src = img.get('src')
-                    if src:
-                        # 处理相对路径
-                        from urllib.parse import urljoin
-                        full_url = urljoin(url, src)
-                        images.append(full_url)
-                extracted_content['images'] = images[:10]  # 最多提取10张图片
-            
-            # 提取链接
-            if 'links' in self.extract_types:
-                links = []
-                for a in soup.find_all('a', href=True):
-                    href = a.get('href')
-                    if href and not href.startswith('#'):
-                        from urllib.parse import urljoin
-                        full_url = urljoin(url, href)
-                        links.append({
-                            'text': a.get_text().strip() or full_url,
-                            'url': full_url
-                        })
-                extracted_content['links'] = links[:20]  # 最多提取20个链接
-            
-            # 提取表格
-            if 'tables' in self.extract_types:
-                tables = []
-                for table in soup.find_all('table'):
-                    table_data = []
-                    # 提取表头
-                    headers = []
-                    thead = table.find('thead')
-                    if thead:
-                        for th in thead.find_all('th'):
-                            headers.append(th.get_text().strip())
-                    
-                    # 提取表体
-                    tbody = table.find('tbody') or table
-                    for row in tbody.find_all('tr'):
-                        row_data = []
-                        for cell in row.find_all(['td', 'th']):
-                            row_data.append(cell.get_text().strip())
-                        if row_data:
-                            table_data.append(row_data)
-                    
-                    if table_data:
-                        tables.append({
-                            'headers': headers,
-                            'rows': table_data
-                        })
-                extracted_content['tables'] = tables[:5]  # 最多提取5个表格
-            
-            # 提取列表
-            if 'lists' in self.extract_types:
-                lists = []
-                # 提取无序列表
-                for ul in soup.find_all('ul'):
-                    list_items = []
-                    for li in ul.find_all('li'):
-                        list_items.append(li.get_text().strip())
-                    if list_items:
-                        lists.append({
-                            'type': 'ul',
-                            'items': list_items[:20]  # 每个列表最多提取20项
-                        })
-                
-                # 提取有序列表
-                for ol in soup.find_all('ol'):
-                    list_items = []
-                    for li in ol.find_all('li'):
-                        list_items.append(li.get_text().strip())
-                    if list_items:
-                        lists.append({
-                            'type': 'ol',
-                            'items': list_items[:20]  # 每个列表最多提取20项
-                        })
-                extracted_content['lists'] = lists[:10]  # 最多提取10个列表
-            
-            # 提取代码块
-            if 'code' in self.extract_types:
-                code_blocks = []
-                for code in soup.find_all(['pre', 'code']):
-                    code_text = code.get_text().strip()
-                    if code_text and len(code_text) > 10:
-                        code_blocks.append(code_text[:1000] + "..." if len(code_text) > 1000 else code_text)
-                extracted_content['code_blocks'] = code_blocks[:5]  # 最多提取5个代码块
-            
-            return extracted_content
+            # 使用WebAnalyzer实例提取特定内容
+            analyzer = WebAnalyzer(self.max_content_length, self.timeout, self.user_agent)
+            return analyzer.extract_specific_content(html, url, self.extract_types)
         except Exception as e:
             logger.error(f"提取特定内容失败: {e}")
             return {}
     
     async def _send_analysis_result(self, event, analysis_results):
         '''发送分析结果，根据开关决定是否使用合并转发'''
-        from astrbot.api.message_components import Node, Plain, Nodes, Image
-        import tempfile
-        import os
-        
-        # 检查是否为群聊消息且合并转发功能已启用
-        group_id = None
-        if hasattr(event, 'group_id') and event.group_id:
-            group_id = event.group_id
-        elif hasattr(event, 'message_obj') and hasattr(event.message_obj, 'group_id') and event.message_obj.group_id:
-            group_id = event.message_obj.group_id
-        
-        # 如果是群聊消息且合并转发功能已启用，使用合并转发
-        if group_id and self.merge_forward_enabled:
-            # 使用合并转发 - 将所有分析结果合并成一个合并转发消息
-            nodes = []
+        try:
+            from astrbot.api.message_components import Node, Plain, Nodes, Image
+            import tempfile
+            import os
             
-            # 添加总标题节点
-            total_title_node = Node(
-                uin=event.get_sender_id(),
-                name="网页分析结果汇总",
-                content=[
-                    Plain(f"共{len(analysis_results)}个网页分析结果")
-                ]
-            )
-            nodes.append(total_title_node)
+            # 检查是否为群聊消息且合并转发功能已启用
+            group_id = None
+            if hasattr(event, 'group_id') and event.group_id:
+                group_id = event.group_id
+            elif hasattr(event, 'message_obj') and hasattr(event.message_obj, 'group_id') and event.message_obj.group_id:
+                group_id = event.message_obj.group_id
             
-            # 为每个URL添加分析结果节点
-            for i, result_data in enumerate(analysis_results, 1):
-                url = result_data['url']
-                analysis_result = result_data['result']
-                screenshot = result_data['screenshot']
+            # 如果是群聊消息且合并转发功能已启用，使用合并转发
+            if group_id and self.merge_forward_enabled:
+                # 使用合并转发 - 将所有分析结果合并成一个合并转发消息
+                nodes = []
                 
-                # 添加当前URL的标题节点
-                url_title_node = Node(
+                # 添加总标题节点
+                total_title_node = Node(
                     uin=event.get_sender_id(),
-                    name=f"分析结果 {i}",
+                    name="网页分析结果汇总",
                     content=[
-                        Plain(f"第{i}个网页分析结果 - {url}")
+                        Plain(f"共{len(analysis_results)}个网页分析结果")
                     ]
                 )
-                nodes.append(url_title_node)
+                nodes.append(total_title_node)
                 
-                # 添加当前URL的内容节点
-                content_node = Node(
-                    uin=event.get_sender_id(),
-                    name="详细分析",
-                    content=[
-                        Plain(analysis_result)
-                    ]
-                )
-                nodes.append(content_node)
+                # 为每个URL添加分析结果节点
+                for i, result_data in enumerate(analysis_results, 1):
+                    url = result_data['url']
+                    analysis_result = result_data['result']
+                    screenshot = result_data.get('screenshot')
+                    
+                    # 添加当前URL的标题节点
+                    url_title_node = Node(
+                        uin=event.get_sender_id(),
+                        name=f"分析结果 {i}",
+                        content=[
+                            Plain(f"第{i}个网页分析结果 - {url}")
+                        ]
+                    )
+                    nodes.append(url_title_node)
+                    
+                    # 添加当前URL的内容节点
+                    content_node = Node(
+                        uin=event.get_sender_id(),
+                        name="详细分析",
+                        content=[
+                            Plain(analysis_result)
+                        ]
+                    )
+                    nodes.append(content_node)
             
-            # 使用Nodes包装所有节点，合并成一个合并转发消息
-            merge_forward_message = Nodes(nodes)
-            
-            # 发送合并转发消息
-            yield event.chain_result([merge_forward_message])
-            
-            # 如果有截图，逐个发送截图
-            for result_data in analysis_results:
-                screenshot = result_data['screenshot']
-                if screenshot:
-                    try:
-                        # 创建临时文件保存截图
-                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
-                            temp_file.write(screenshot)
-                            temp_file_path = temp_file.name
-                        
-                        # 使用Image.fromFileSystem()方法发送图片
-                        image_component = Image.fromFileSystem(temp_file_path)
-                        yield event.chain_result([image_component])
-                        logger.info(f"群聊 {group_id} 使用合并转发发送分析结果，并发送截图")
-                        
-                        # 删除临时文件
-                        os.unlink(temp_file_path)
-                    except Exception as e:
-                        logger.error(f"发送截图失败: {e}")
-                        # 确保临时文件被删除
-                        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+                # 使用Nodes包装所有节点，合并成一个合并转发消息
+                merge_forward_message = Nodes(nodes)
+                
+                # 发送合并转发消息
+                yield event.chain_result([merge_forward_message])
+                
+                # 如果有截图，逐个发送截图
+                for result_data in analysis_results:
+                    screenshot = result_data.get('screenshot')
+                    if screenshot:
+                        try:
+                            # 根据截图格式设置文件后缀
+                            suffix = f".{self.screenshot_format}" if self.screenshot_format else ".jpg"
+                            # 创建临时文件保存截图
+                            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+                                temp_file.write(screenshot)
+                                temp_file_path = temp_file.name
+                            
+                            # 使用Image.fromFileSystem()方法发送图片
+                            image_component = Image.fromFileSystem(temp_file_path)
+                            yield event.chain_result([image_component])
+                            logger.info(f"群聊 {group_id} 使用合并转发发送分析结果，并发送截图")
+                            
+                            # 删除临时文件
                             os.unlink(temp_file_path)
-            logger.info(f"群聊 {group_id} 使用合并转发发送{len(analysis_results)}个分析结果")
-        else:
-            # 普通发送 - 逐个发送分析结果
-            for i, result_data in enumerate(analysis_results, 1):
-                url = result_data['url']
-                analysis_result = result_data['result']
-                screenshot = result_data['screenshot']
-                
-                # 发送分析结果文本
-                if len(analysis_results) == 1:
-                    result_text = f"网页分析结果：\n{analysis_result}"
-                else:
-                    result_text = f"第{i}/{len(analysis_results)}个网页分析结果：\n{analysis_result}"
-                yield event.plain_result(result_text)
-                
-                # 如果有截图，发送截图
-                if screenshot:
-                    try:
-                        # 创建临时文件保存截图
-                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
-                            temp_file.write(screenshot)
-                            temp_file_path = temp_file.name
-                        
-                        # 使用Image.fromFileSystem()方法发送图片
-                        image_component = Image.fromFileSystem(temp_file_path)
-                        yield event.chain_result([image_component])
-                        logger.info("普通发送分析结果，并发送截图")
-                        
-                        # 删除临时文件
-                        os.unlink(temp_file_path)
-                    except Exception as e:
-                        logger.error(f"发送截图失败: {e}")
-                        # 确保临时文件被删除
-                        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+                        except Exception as e:
+                            logger.error(f"发送截图失败: {e}")
+                            # 确保临时文件被删除
+                            if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+                                os.unlink(temp_file_path)
+                logger.info(f"群聊 {group_id} 使用合并转发发送{len(analysis_results)}个分析结果")
+            else:
+                # 普通发送 - 逐个发送分析结果
+                for i, result_data in enumerate(analysis_results, 1):
+                    url = result_data['url']
+                    analysis_result = result_data['result']
+                    screenshot = result_data.get('screenshot')
+                    
+                    # 发送分析结果文本
+                    if len(analysis_results) == 1:
+                        result_text = f"网页分析结果：\n{analysis_result}"
+                    else:
+                        result_text = f"第{i}/{len(analysis_results)}个网页分析结果：\n{analysis_result}"
+                    yield event.plain_result(result_text)
+                    
+                    # 如果有截图，发送截图
+                    if screenshot:
+                        try:
+                            # 根据截图格式设置文件后缀
+                            suffix = f".{self.screenshot_format}" if self.screenshot_format else ".jpg"
+                            # 创建临时文件保存截图
+                            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+                                temp_file.write(screenshot)
+                                temp_file_path = temp_file.name
+                            
+                            # 使用Image.fromFileSystem()方法发送图片
+                            image_component = Image.fromFileSystem(temp_file_path)
+                            yield event.chain_result([image_component])
+                            logger.info("普通发送分析结果，并发送截图")
+                            
+                            # 删除临时文件
                             os.unlink(temp_file_path)
-            message_type = "群聊" if group_id else "私聊"
-            logger.info(f"{message_type}消息普通发送{len(analysis_results)}个分析结果")
+                        except Exception as e:
+                            logger.error(f"发送截图失败: {e}")
+                            # 确保临时文件被删除
+                            if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+                                os.unlink(temp_file_path)
+                message_type = "群聊" if group_id else "私聊"
+                logger.info(f"{message_type}消息普通发送{len(analysis_results)}个分析结果")
+        except Exception as e:
+            logger.error(f"发送分析结果失败: {e}")
+            yield event.plain_result(f"❌ 发送分析结果失败: {str(e)}")
     
     async def terminate(self):
         """插件卸载时的清理工作"""

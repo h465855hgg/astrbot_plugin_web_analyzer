@@ -11,6 +11,18 @@
     "hint": "网页请求的超时时间，超过该时间将放弃抓取",
     "default": 30
   },
+  "retry_count": {
+    "description": "请求重试次数",
+    "type": "int",
+    "hint": "网页请求失败后的重试次数",
+    "default": 3
+  },
+  "retry_delay": {
+    "description": "请求重试间隔(秒)",
+    "type": "int",
+    "hint": "网页请求失败后，重试前的等待时间",
+    "default": 2
+  },
   "llm_enabled": {
     "description": "启用LLM智能分析",
     "type": "bool",
@@ -28,6 +40,12 @@
     "type": "string",
     "hint": "自定义请求头中的User-Agent，用于绕过某些网站的访问限制",
     "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+  },
+  "proxy": {
+    "description": "HTTP代理配置",
+    "type": "string",
+    "hint": "HTTP代理地址，格式为http://username:password@host:port，留空表示不使用代理",
+    "default": ""
   },
   "allowed_domains": {
     "description": "允许的域名列表",
@@ -93,6 +111,18 @@
         "type": "int",
         "hint": "截图前等待页面加载的时间（毫秒）",
         "default": 2000
+      },
+      "screenshot_height": {
+        "description": "截图高度",
+        "type": "int",
+        "hint": "网页截图的高度像素",
+        "default": 720
+      },
+      "screenshot_format": {
+        "description": "截图格式",
+        "type": "string",
+        "hint": "网页截图的格式，支持jpeg和png",
+        "default": "jpeg"
       }
     }
   },

@@ -78,13 +78,12 @@ def create_logo():
         text = "Web"
         text_bbox = draw.textbbox((0, 0), text, font=font)
         text_width = text_bbox[2] - text_bbox[0]
-        text_height = text_bbox[3] - text_bbox[1]
-        
+
         text_x = center[0] - text_width // 2
-        text_y = browser_y + browser_height + 30
-        
+        text_y = center[1] + radius + 10
+
         draw.text((text_x, text_y), text, fill=(66, 133, 244, 255), font=font)
-    except:
+    except Exception:
         # 如果字体不可用，跳过文字
         pass
     
